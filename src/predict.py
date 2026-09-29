@@ -4,7 +4,7 @@ predict.py
 Speaker inference + optional speech-to-text transcript.
 
 Pipeline:
-    audio -> preprocessing -> segments -> MFCC features -> scaler -> model.predict_proba
+    audio -> preprocessing -> segments -> ECAPA embeddings -> scaler -> model.predict_proba
     -> average probabilities over all segments (soft voting)
     -> top speaker, or "Unknown Voice" if confidence < threshold
 
@@ -28,7 +28,14 @@ if __package__ in (None, ""):
 import joblib
 import numpy as np
 
-from src.features import FEATURE_DIM, extract_features_batch
+from src.embeddings import (
+    ECAPA_DIM,
+    FEATURE_LABEL,
+    FEATURE_TYPE,
+    EmbeddingUnavailableError,
+    extract,
+    get_encoder,
+)
 from src.preprocess import (
     MODELS_DIR,
     SAMPLE_RATE,
@@ -97,13 +104,23 @@ class VoicePredictor:
         except Exception as exc:
             raise ModelNotTrainedError(f"Model files are corrupt or incompatible ({exc}). Please retrain.") from exc
 
-        if getattr(self.scaler, "n_features_in_", FEATURE_DIM) != FEATURE_DIM:
-            raise ModelNotTrainedError("Saved model uses a different feature configuration. Please retrain.")
         if not hasattr(self.model, "predict_proba"):
             raise ModelNotTrainedError("Saved model does not support probability estimates. Please retrain.")
 
         self.metadata = self._load_metadata()
         self.noise_reduction = bool(self.metadata.get("noise_reduction", True))
+        self.feature_type = str(self.metadata.get("feature_type", FEATURE_TYPE))
+        if self.feature_type != FEATURE_TYPE:
+            raise ModelNotTrainedError(
+                f"Saved model was trained with '{self.feature_type}' features, but this version "
+                f"only supports ECAPA embeddings. Please retrain."
+            )
+        if getattr(self.scaler, "n_features_in_", ECAPA_DIM) != ECAPA_DIM:
+            raise ModelNotTrainedError("Saved model uses a different feature configuration. Please retrain.")
+        try:
+            get_encoder()
+        except EmbeddingUnavailableError as exc:
+            raise ModelNotTrainedError(f"Model needs the pretrained ECAPA encoder, but {exc}") from exc
         self.class_names = [str(c) for c in self.label_encoder.inverse_transform(self.model.classes_)]
 
     def _load_metadata(self) -> dict:
@@ -125,7 +142,7 @@ class VoicePredictor:
             AudioProcessingError: unreadable file or not enough speech.
         """
         cleaned, segments = preprocess_file(audio_path, noise_reduction=self.noise_reduction)
-        X = self.scaler.transform(extract_features_batch(segments))
+        X = self.scaler.transform(extract(segments))
         segment_proba = self.model.predict_proba(X)
         mean_proba = segment_proba.mean(axis=0)  # soft voting over segments
 
@@ -204,7 +221,7 @@ def main(argv: list[str] | None = None) -> int:
     status = "RECOGNIZED" if result.is_known else "UNKNOWN"
     print(f"Speaker    : {result.speaker}  [{status}]")
     print(f"Confidence : {result.confidence:.2%} (threshold {result.threshold:.0%}, closest: {result.top_candidate})")
-    print(f"Segments   : {result.n_segments}")
+    print(f"Segments   : {result.n_segments} ({FEATURE_LABEL})")
     print("Probabilities:")
     for name, p in result.probabilities.items():
         print(f"  {name:<20} {p:7.2%}  {'#' * int(p * 40)}")

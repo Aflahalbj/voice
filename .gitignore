@@ -16,6 +16,7 @@ data/raw/*
 # Trained model artifacts - regenerate with `python src/train.py`
 models/*
 !models/.gitkeep
+models_*/
 
 # Pretrained model downloads (e.g. SpeechBrain / HuggingFace cache)
 pretrained_models/

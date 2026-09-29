@@ -1,8 +1,8 @@
 # 🏠 Home Owner Voice Recognition System
 
-Speaker recognition for a household: register family members with a few voice samples, train a classical ML model on MFCC features, and identify who is speaking from a new recording — with a confidence score and an **Unknown Voice** result for strangers.
+Speaker recognition for a household: register family members with a few voice samples, train a classifier on pretrained **ECAPA-TDNN** speaker embeddings, and identify who is speaking from a new recording — with a confidence score and an **Unknown Voice** result for strangers.
 
-No deep learning: **Librosa** (audio + MFCC), **scikit-learn** (SVM / Random Forest / MLP), **SpeechRecognition** (transcript) and **Streamlit** (web UI).
+Method: **Librosa** (audio loading, noise reduction, segmentation), **SpeechBrain ECAPA-TDNN** (192-d speaker embedding per segment), **scikit-learn** (SVM / Random Forest / MLP on top of the embeddings), **SpeechRecognition** (transcript) and **Streamlit** (web UI).
 
 ---
 
@@ -23,6 +23,8 @@ pip install -r requirements.txt
 ```
 
 **Audio formats:** WAV, MP3, FLAC and OGG are decoded by `soundfile` (bundled libsndfile). If an MP3 fails to load on your system, install [FFmpeg](https://ffmpeg.org/download.html) and add it to your `PATH` — librosa falls back to it automatically.
+
+**Pretrained model:** the first training or prediction run downloads the ECAPA-TDNN checkpoint (~80 MB) from HuggingFace into `pretrained_models/`, so it needs an internet connection once. After that everything runs offline on the CPU.
 
 **Transcript:** uses the free Google Web Speech API through SpeechRecognition, so it needs an internet connection. When offline, the app shows a warning and everything else keeps working.
 
@@ -65,8 +67,8 @@ Open http://localhost:8501.
 | Page | What it does |
 |------|--------------|
 | 🎙️ **Register Member** | Enter a name, record with the microphone or upload WAV/MP3/FLAC/OGG files. Clips are validated and saved as 16 kHz mono WAV in `data/raw/<name>/`. |
-| 🧠 **Train Model** | Trains SVM, Random Forest and MLP, shows accuracy per model, the confusion matrix, the classification report and the selected model. |
-| 🔍 **Identify Voice** | Record or upload audio → predicted speaker, similarity %, probability chart, transcript, waveform and MFCC heatmap. Green badge = recognized, red = unknown. |
+| 🧠 **Train Model** | Encodes every segment with ECAPA, trains SVM, Random Forest and MLP, shows accuracy per model, the confusion matrix, the classification report and the selected model. |
+| 🔍 **Identify Voice** | Record or upload audio → predicted speaker, similarity %, probability chart, transcript, waveform and log-mel spectrogram. Green badge = recognized, red = unknown. |
 | 📊 **Dataset** | Samples and duration per member, delete individual samples or a whole member. |
 
 After adding or deleting members, **retrain the model**.
@@ -81,13 +83,14 @@ Every module runs standalone (from the project root):
 # Inspect preprocessing of one file (optionally save the segments)
 python src/preprocess.py data/raw/Dad/reading_01.wav --augment --out-dir segments/
 
-# Show the extracted feature vector
-python src/features.py data/raw/Dad/reading_01.wav
+# Show the ECAPA embedding of one file
+python src/embeddings.py data/raw/Dad/reading_01.wav
 
 # Train (augmentation, balancing and noise reduction are on by default)
 python src/train.py
 python src/train.py --no-augment --no-balance --no-noise-reduction --test-size 0.2
 python src/train.py --overlap 0.5      # overlapping segments -> more training data
+python src/train.py --models-dir models_test   # train into a separate folder
 
 # Predict
 python src/predict.py test.wav
@@ -108,10 +111,12 @@ python src/predict.py test.wav --threshold 0.7 --transcribe --language id-ID
 5. Split into 2.5 s segments (min 1 s) → more training samples.
 6. Optional augmentation on the training split only: Gaussian noise injection (SNR 15–30 dB) and pitch shift (±0.5–1 semitone).
 
-**Features** (`src/features.py`) — per segment:
-- 40 MFCCs (`n_fft=2048`, `hop_length=512`) + delta + delta-delta
-- Spectral centroid, spectral rolloff, zero crossing rate, 12 chroma bins
-- Mean and standard deviation of every row → **270-dimensional** vector, then `StandardScaler`
+**Features — ECAPA embeddings** (`src/embeddings.py`) — per segment:
+- A pretrained ECAPA-TDNN model (`speechbrain/spkrec-ecapa-voxceleb`, trained on thousands of VoxCeleb speakers) maps each segment to a **192-dimensional**, L2-normalized speaker embedding.
+- Internally the model consumes an 80-band log-mel filterbank (25 ms window, 10 ms hop) and its TDNN + attentive-statistics-pooling layers compress it into a vector that describes *who* is speaking — far less sensitive to the microphone, the room and the spoken words than hand-crafted spectral averages.
+- The embedding is then standardized with `StandardScaler` and fed to the scikit-learn classifiers. Segments are encoded in batches of 16 on the CPU.
+- The Identify page shows the same log-mel spectrogram the model sees, for a visual sanity check.
+- `feature_type` and `feature_dim` are stored in `metadata.json`; loading a model trained with a different representation is refused with a "please retrain" message.
 
 **Training** (`src/train.py`)
 - Stratified 80/20 split **grouped by source recording**: every segment of one file lands
@@ -143,7 +148,9 @@ python src/predict.py test.wav --threshold 0.7 --transcribe --language id-ID
 | "At least 2 registered members…" | Register a second member. |
 | "Not enough usable speech for: …" | Add more/longer recordings for the listed members. |
 | "Model has not been trained yet" | Open **Train Model** and click **Start training**. |
-| "Saved model uses a different feature configuration" | Feature settings changed — retrain. |
+| "Saved model uses a different feature configuration" | The model predates the ECAPA-only pipeline — retrain. |
+| "Could not load the ECAPA model" | First run needs internet to download the checkpoint; check the connection or that `pretrained_models/` is writable. |
+| "ECAPA needs torch, torchaudio and speechbrain" | `pip install -r requirements.txt` (CPU wheels: `pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu`). |
 | File skipped as corrupt | Re-export it as WAV, or install FFmpeg for exotic MP3 encodings. |
 | Transcript unavailable | No internet or no recognizable words — prediction still works. |
 | Strangers recognized as a member | Raise the threshold (e.g. 0.70–0.80) and add more varied samples per member. |
@@ -162,11 +169,12 @@ voice-recognition/
 ├── src/
 │   ├── __init__.py
 │   ├── preprocess.py   # load, resample, noise reduction, trim silence, segmentation, augmentation
-│   ├── features.py     # MFCC + spectral feature extraction
+│   ├── embeddings.py   # pretrained ECAPA-TDNN speaker embeddings (the features)
 │   ├── train.py        # training, model comparison, evaluation, saving
 │   └── predict.py      # inference + transcription
 ├── data/raw/<person_name>/*.wav
 ├── models/             # model.pkl, scaler.pkl, label_encoder.pkl, metadata.json, confusion_matrix.png
+├── pretrained_models/  # downloaded ECAPA-TDNN checkpoint (git-ignored)
 ├── requirements.txt
 └── README.md
 ```

@@ -10,6 +10,7 @@ Run with:
 from __future__ import annotations
 
 import html
+import logging
 import re
 import shutil
 import sys
@@ -21,6 +22,16 @@ from pathlib import Path
 # Make `src` importable no matter where streamlit is launched from
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+# Streamlit's hot-reload watcher walks the __path__ of every imported module. SpeechBrain and
+# torch register lazy submodules for optional integrations (flair, torch.classes, ...), so
+# touching them raises ImportError. The watcher catches it and simply skips the module - only
+# a long traceback is left in the console, so drop exactly those records.
+logging.getLogger("streamlit.watcher.local_sources_watcher").addFilter(
+    lambda record: not any(
+        name in record.getMessage() for name in ("speechbrain", "torch.classes", "flair")
+    )
+)
+
 import matplotlib  # noqa: E402
 
 matplotlib.use("Agg")
@@ -31,7 +42,13 @@ import pandas as pd  # noqa: E402
 import streamlit as st  # noqa: E402
 from matplotlib.ticker import PercentFormatter  # noqa: E402
 
-from src.features import HOP_LENGTH, compute_mfcc  # noqa: E402
+from src.embeddings import (  # noqa: E402
+    FEATURE_LABEL,
+    MEL_HOP_LENGTH,
+    EmbeddingUnavailableError,
+    is_available as ecapa_available,
+    log_mel_spectrogram,
+)
 from src.predict import (  # noqa: E402
     DEFAULT_THRESHOLD,
     MODEL_FILE,
@@ -187,13 +204,14 @@ def plot_waveform(y: np.ndarray, sr: int) -> plt.Figure:
     return fig
 
 
-def plot_mfcc(y: np.ndarray, sr: int) -> plt.Figure:
-    mfcc = compute_mfcc(y, sr)
+def plot_melspectrogram(y: np.ndarray, sr: int) -> plt.Figure:
+    mel = log_mel_spectrogram(y, sr)
     fig, ax = plt.subplots(figsize=(7, 2.8))
-    img = librosa.display.specshow(mfcc, x_axis="time", sr=sr, hop_length=HOP_LENGTH, ax=ax, cmap="magma")
-    fig.colorbar(img, ax=ax)
-    ax.set_title("MFCC heatmap")
-    ax.set_ylabel("MFCC coefficient")
+    img = librosa.display.specshow(mel, x_axis="time", y_axis="mel", sr=sr,
+                                   hop_length=MEL_HOP_LENGTH, ax=ax, cmap="magma")
+    fig.colorbar(img, ax=ax, format="%+2.0f dB")
+    ax.set_title("Log-mel spectrogram (ECAPA input)")
+    ax.set_ylabel("Mel band")
     fig.tight_layout()
     return fig
 
@@ -327,6 +345,7 @@ def render_training_summary(summary: dict) -> None:
                   else "segment-level (fallback)")
     st.caption(
         f"Trained {summary['created_at']} · members: {', '.join(summary['labels'])} · "
+        f"features {FEATURE_LABEL} · "
         f"split {split_kind} · augmentation {'on' if summary['augment'] else 'off'} · "
         f"balancing {'on' if summary.get('balance') else 'off'} · "
         f"noise reduction {'on' if summary['noise_reduction'] else 'off'}"
@@ -428,7 +447,13 @@ def page_train() -> None:
                             help="Oversamples members with fewer samples in the training split, "
                                  "so a member with twice the data does not dominate.")
 
-    if st.button("🚀 Start training", type="primary", disabled=not enough_members):
+    st.caption(f"Features: {FEATURE_LABEL}. The first training run downloads the "
+               f"~80 MB pretrained model into `pretrained_models/`.")
+    encoder_ready = ecapa_available()
+    if not encoder_ready:
+        st.error("ECAPA needs torch, torchaudio and speechbrain: `pip install -r requirements.txt`.")
+
+    if st.button("🚀 Start training", type="primary", disabled=not (enough_members and encoder_ready)):
         progress = st.progress(0.0, text="Starting...")
 
         def on_progress(fraction: float, message: str) -> None:
@@ -442,7 +467,7 @@ def page_train() -> None:
             _load_predictor.clear()
             st.success(f"Training finished — selected **{result.best_model}** "
                        f"with {result.test_accuracy:.1%} test accuracy.")
-        except InsufficientDataError as exc:
+        except (InsufficientDataError, EmbeddingUnavailableError) as exc:
             progress.empty()
             st.error(str(exc))
         except Exception as exc:  # unexpected errors: show details instead of crashing the app
@@ -499,13 +524,13 @@ def render_prediction(result: PredictionResult, audio_bytes: bytes, suffix: str,
         st.caption("Transcription disabled.")
 
     st.markdown("#### Visualizations")
-    col_wave, col_mfcc = st.columns(2)
+    col_wave, col_mel = st.columns(2)
     with col_wave:
         fig = plot_waveform(result.signal, result.sample_rate)
         st.pyplot(fig)
         plt.close(fig)
-    with col_mfcc:
-        fig = plot_mfcc(result.signal, result.sample_rate)
+    with col_mel:
+        fig = plot_melspectrogram(result.signal, result.sample_rate)
         st.pyplot(fig)
         plt.close(fig)
 
@@ -530,6 +555,7 @@ def page_identify() -> None:
         return
 
     st.caption(f"Model: **{predictor.metadata.get('best_model', 'unknown')}** · "
+               f"Features: {FEATURE_LABEL} · "
                f"Members: {', '.join(predictor.members)}")
 
     col1, col2, col3 = st.columns([2, 1, 1])

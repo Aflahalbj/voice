@@ -1,12 +1,12 @@
 """
 train.py
 --------
-Train and compare speaker classifiers (SVM, Random Forest, MLP).
+Train and compare speaker classifiers (SVM, Random Forest, MLP) on ECAPA embeddings.
 
 Steps:
     1. Preprocess every file in data/raw/<member>/ and split into segments
        (each segment remembers which source file it came from)
-    2. Extract MFCC feature vectors
+    2. Encode every segment with the pretrained ECAPA-TDNN model -> 192-d speaker embedding
     3. Stratified 80/20 train/test split GROUPED BY SOURCE FILE, so segments of
        the same recording never appear in both train and test
     4. Optional augmentation (noise + pitch shift) on the TRAIN split only
@@ -57,7 +57,14 @@ from sklearn.pipeline import Pipeline  # noqa: E402
 from sklearn.preprocessing import LabelEncoder, StandardScaler  # noqa: E402
 from sklearn.svm import SVC  # noqa: E402
 
-from src.features import FEATURE_DIM, extract_features, extract_features_batch  # noqa: E402
+from src.embeddings import (  # noqa: E402
+    ECAPA_DIM,
+    FEATURE_LABEL,
+    FEATURE_TYPE,
+    EmbeddingUnavailableError,
+    extract,
+    get_encoder,
+)
 from src.preprocess import (  # noqa: E402
     DATA_DIR,
     MODELS_DIR,
@@ -131,6 +138,7 @@ class TrainingResult:
     noise_reduction: bool
     skipped_files: list[tuple[str, str]]
     warnings: list[str] = field(default_factory=list)
+    feature_type: str = FEATURE_TYPE
     confusion_plot: str = CONFUSION_FILE
     created_at: str = field(default_factory=lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
@@ -139,7 +147,7 @@ class TrainingResult:
         data = asdict(self)
         data["confusion_matrix"] = self.confusion_matrix.tolist()
         data["file_confusion_matrix"] = self.file_confusion_matrix.tolist()
-        data["feature_dim"] = FEATURE_DIM
+        data["feature_dim"] = ECAPA_DIM
         data["sample_rate"] = SAMPLE_RATE
         data["members"] = self.labels
         return data
@@ -340,14 +348,18 @@ def train_models(
     cb = progress_callback
     notes: list[str] = []
 
+    # Fail fast (missing packages / no internet) before the slow preprocessing step
+    _notify(cb, 0.0, "Loading pretrained ECAPA model...")
+    get_encoder()
+
     # 1. Preprocess ----------------------------------------------------------
     _notify(cb, 0.0, "Scanning dataset...")
     dataset = load_dataset(data_dir, noise_reduction, overlap, cb, span=(0.0, 0.35))
 
     # 2. Features ------------------------------------------------------------
-    X_all = extract_features_batch(
+    X_all = extract(
         dataset.segments,
-        progress_callback=lambda i, t: _notify(cb, 0.35 + 0.20 * i / t, f"Extracting MFCC features {i}/{t}"),
+        progress_callback=lambda i, t: _notify(cb, 0.35 + 0.20 * i / t, f"Encoding ECAPA embeddings {i}/{t}"),
     )
     encoder = LabelEncoder()
     y_all = encoder.fit_transform(dataset.labels)
@@ -371,14 +383,19 @@ def train_models(
     # 4. Augmentation (train split only, avoids test leakage) ---------------
     if augment:
         rng = np.random.default_rng(RANDOM_STATE)
-        aug_X, aug_y, aug_g = [], [], []
+        aug_segments, aug_y, aug_g = [], [], []
         for k, i in enumerate(train_idx, 1):
             for variant in augment_segment(dataset.segments[i], SAMPLE_RATE, rng):
-                aug_X.append(extract_features(variant))
+                aug_segments.append(variant)
                 aug_y.append(y_all[i])
                 aug_g.append(file_ids[i])
-            _notify(cb, 0.55 + 0.15 * k / len(train_idx), f"Augmenting segments {k}/{len(train_idx)}")
-        X_train = np.vstack([X_train, np.vstack(aug_X)])
+            _notify(cb, 0.55 + 0.05 * k / len(train_idx), f"Augmenting segments {k}/{len(train_idx)}")
+        aug_X = extract(
+            aug_segments,
+            progress_callback=lambda i, t: _notify(cb, 0.60 + 0.10 * i / t,
+                                                   f"Encoding ECAPA embeddings (augmented) {i}/{t}"),
+        )
+        X_train = np.vstack([X_train, aug_X])
         y_train = np.concatenate([y_train, np.array(aug_y)])
         groups = np.concatenate([groups, np.array(aug_g)])
 
@@ -510,7 +527,8 @@ def print_summary(result: TrainingResult) -> None:
         marker = "  <- selected" if s.model == result.best_model else ""
         print(f"{s.model:<16}{s.cv_mean:>10.2%} ± {s.cv_std:<5.2%}{s.test_accuracy:>16.2%}{marker}")
     split_kind = "grouped by recording" if result.grouped_split else "segment-level (fallback)"
-    print(f"\nSegments: {result.n_segments} (train {result.n_train} / test {result.n_test}), "
+    print(f"\nFeatures: {FEATURE_LABEL}")
+    print(f"Segments: {result.n_segments} (train {result.n_train} / test {result.n_test}), "
           f"split {split_kind}")
     print(f"Training rows after augmentation/balancing: {result.n_train_rows}, "
           f"{result.cv_folds}-fold CV, augmentation={'on' if result.augment else 'off'}, "
@@ -568,7 +586,7 @@ def main(argv: list[str] | None = None) -> int:
             overlap=args.overlap,
             progress_callback=cli_progress,
         )
-    except InsufficientDataError as exc:
+    except (InsufficientDataError, EmbeddingUnavailableError) as exc:
         print(f"[ERROR] {exc}", file=sys.stderr)
         return 1
 

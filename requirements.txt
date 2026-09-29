@@ -12,6 +12,12 @@ matplotlib==3.10.1
 streamlit==1.44.1
 SpeechRecognition==3.14.2
 
+# ECAPA-TDNN speaker embeddings (the feature extractor). CPU-only wheels are much smaller:
+#   pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
+torch==2.14.0
+torchaudio==2.11.0
+speechbrain==1.1.1
+
 # Python 3.13 removed these stdlib modules (used by SpeechRecognition / audioread)
 standard-aifc==3.13.0; python_version >= "3.13"
 audioop-lts==0.2.1; python_version >= "3.13"
